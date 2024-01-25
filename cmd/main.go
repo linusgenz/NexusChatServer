@@ -4,29 +4,21 @@ import (
 	"crypto/tls"
 	"log"
 	"net/http"
+	"os"
 	"webserver/internal/api"
 	"webserver/internal/webrtc"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
-	"github.com/jiyeyuran/mediasoup-go"
+	"github.com/joho/godotenv"
 )
 
 func main() {
-	port := ":3300"
-	router := mux.NewRouter()
-
-	worker, err := mediasoup.NewWorker(
-		mediasoup.WithLogLevel("debug"),
-		mediasoup.WithRtcMinPort(40000),
-		mediasoup.WithRtcMaxPort(49999),
-	)
-
-	if err != nil {
-		log.Fatal("Mediasoup worker error:", err)
+	if err := godotenv.Load("../.env"); err != nil {
+		log.Fatal("Error loading .env file", err)
 	}
-	worker.On("died", func(err error) {
-		log.Fatalf("mediasoup worker has died %v\n", err)
-	})
+
+	PORT := os.Getenv("PORT")
+	router := mux.NewRouter()
 
 	headersOk := handlers.AllowedHeaders([]string{"Content-Type", "Authorization"})
 	originsOk := handlers.AllowedOrigins([]string{"*"})
@@ -37,12 +29,13 @@ func main() {
 	apiRouter.HandleFunc("/list", api.List).Methods("GET")
 	apiRouter.HandleFunc("/{serverid}/channels", api.Channels).Methods("GET")
 	apiRouter.HandleFunc("/create", api.Create).Methods("POST")
+	apiRouter.HandleFunc("/auth/login", api.LoginHandler).Methods("POST")
+	apiRouter.HandleFunc("/auth/register", api.RegisterHandler).Methods("POST")
+	router.PathPrefix("/public/").Handler(http.StripPrefix("/public/", http.FileServer(http.Dir("../public"))))
 
-	router.PathPrefix("/public/").Handler(http.StripPrefix("/public/", http.FileServer(http.Dir("public"))))
-
-	log.Printf("Go server running at port %v \n", port)
+	log.Printf("Go server running at port %v \n", PORT)
 	router.Handle("/", handler)
-	router.HandleFunc("/mediasoup", webrtc.HandleWebSocketConnections)
+	router.HandleFunc("/wss", webrtc.HandleWebSocketConnections)
 
 	tlsConfig := &tls.Config{
 		MinVersion:               tls.VersionTLS12,
@@ -52,10 +45,10 @@ func main() {
 	}
 
 	server := &http.Server{
-		Addr:      port,
+		Addr:      PORT,
 		Handler:   handler,
 		TLSConfig: tlsConfig,
 	}
 
-	server.ListenAndServeTLS("./ssl/cert.pem", "./ssl/key.pem")
+	server.ListenAndServeTLS("../ssl/cert.pem", "../ssl/key.pem")
 }
