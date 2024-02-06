@@ -7,16 +7,11 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"log"
 	"net/http"
-	"os"
-	//"strconv"
-	"fmt"
+	"strconv"
 	"time"
+	"webserver/internal/config"
 	"webserver/internal/helper"
 )
-
-var secretKey = []byte(os.Getenv("JWT_SECRET_KEY"))
-var PORT = os.Getenv("PORT")
-var HOST = os.Getenv("HOST")
 
 type user struct {
 	Id             int64  `json:"id"`
@@ -24,34 +19,39 @@ type user struct {
 	Email          string `json:"email"`
 	Password       string `json:"password"`
 	hashedPassword []byte
-	Img_url        string `json:"img_url"`
-	Display_name   string `json:"display_name"`
+	ImgUrl         string `json:"imgUrl"`
+	DisplayName    string `json:"displayName"`
 }
 
 type JWTClaims struct {
-	UserID   int64  `json:"user_id"`
+	UserID   int64  `json:"userId"`
 	Username string `json:"username"`
 	jwt.StandardClaims
 }
 
 type authResponse struct {
-	Token        string `json:"token"`
-	Display_name string `json:"display_name"`
-	Username     string `json:"username"`
+	Token       string `json:"token"`
+	DisplayName string `json:"displayName"`
+	Username    string `json:"username"`
+	UserId      string `json:"userId"`
+	Img         string `json:"img"`
 }
 
 func LoginHandler(w http.ResponseWriter, r *http.Request) {
 	var userCredentials user
 
 	if err := json.NewDecoder(r.Body).Decode(&userCredentials); err != nil {
+		log.Println(err, r.Body, userCredentials)
 		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
 
+	log.Println("userCredentials", userCredentials)
+
 	ok, user, err := validateUserCredentials(userCredentials)
 	if err != nil {
 		log.Print(err)
-		http.Error(w, "Error validating user credentials", http.StatusInternalServerError)
+		http.Error(w, "Error validating websocket credentials", http.StatusInternalServerError)
 		return
 	}
 	if !ok {
@@ -65,11 +65,14 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var data = authResponse{Token: token, Display_name: user.Display_name, Username: user.Username}
+	var data = authResponse{Token: token, DisplayName: user.DisplayName, Username: user.Username, UserId: strconv.FormatInt(user.Id, 10), Img: user.ImgUrl}
 	res, err := json.Marshal(data)
 	w.WriteHeader(http.StatusOK)
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(res)
+	_, err = w.Write(res)
+	if err != nil {
+		return
+	}
 }
 
 func RegisterHandler(w http.ResponseWriter, r *http.Request) {
@@ -78,8 +81,10 @@ func RegisterHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
+	log.Println(r.Body)
+	log.Println(userData)
 
-	ok, err := addUserToDb(userData)
+	ok, err, user := addUserToDb(userData)
 	if err != nil {
 		log.Print(err)
 		http.Error(w, "Error adding user to db", http.StatusInternalServerError)
@@ -90,16 +95,19 @@ func RegisterHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := generateJWTToken(userData)
+	token, err := generateJWTToken(user)
 	if err != nil {
 		http.Error(w, "Error generating JWT token", http.StatusInternalServerError)
 		return
 	}
 
-	var data = authResponse{Token: token, Display_name: userData.Display_name, Username: userData.Username}
+	var data = authResponse{Token: token, DisplayName: user.DisplayName, Username: user.Username, UserId: strconv.FormatInt(user.Id, 10), Img: user.ImgUrl}
 	res, err := json.Marshal(data)
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(res)
+	_, err = w.Write(res)
+	if err != nil {
+		return
+	}
 }
 
 func AuthMiddleware(next http.Handler) http.Handler {
@@ -111,7 +119,7 @@ func AuthMiddleware(next http.Handler) http.Handler {
 		}
 
 		token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
-			return secretKey, nil
+			return config.JwtKey, nil
 		})
 
 		if err != nil || !token.Valid {
@@ -123,73 +131,95 @@ func AuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func validateUserCredentials(creds user) (bool, user, error) {
-	db, err := sql.Open("sqlite3", "../data/data.sqlite")
+func validateUserCredentials(credentials user) (bool, user, error) {
+	tx, err := config.UseDBPool().DB.Begin()
 	if err != nil {
+		log.Println(err)
 		return false, user{}, err
 	}
 
-	rows, err := db.Query("SELECT * FROM users WHERE username = ?", creds.Username)
+	defer func() {
+		if err := config.UseDBPool().RollbackOrCommit(tx, err == nil); err != nil {
+			log.Println("Error rolling back transaction:", err)
+		}
+	}()
+
+	rows, err := tx.Query("SELECT user_id, username, password, display_name FROM users WHERE username = ? LIMIT 1", credentials.Username)
+
+	defer func(rows *sql.Rows) {
+		err := rows.Close()
+		if err != nil {
+			log.Println(err)
+		}
+	}(rows)
 
 	if err != nil {
 		return false, user{}, err
 	}
-	var user_id int64
+	var userId int64
 	var username string
 	var password []byte
-	var url string
-	var display_name string
-	var email string
-	var created_at time.Time
+	var displayName string
 
 	for rows.Next() {
-		err = rows.Scan(&user_id, &username, &display_name, &email, &url, &password, &created_at)
+		err = rows.Scan(&userId, &username, &displayName, &password)
 	}
 
-	var passwordIsValid = bcrypt.CompareHashAndPassword(password, []byte(creds.Password))
+	log.Println(userId, username, displayName, password)
+
+	var passwordIsValid = bcrypt.CompareHashAndPassword(password, []byte(credentials.Password))
 
 	if passwordIsValid != nil {
 		return false, user{}, nil
 	}
-	defer rows.Close()
-	return true, user{Id: user_id, Username: username, Display_name: display_name}, nil
+	return true, user{Id: userId, Username: username, DisplayName: displayName}, nil
 }
 
-func addUserToDb(user user) (bool, error) {
-	user.Id = helper.GenerateUniqueId()
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
-	user.hashedPassword = hashedPassword
+func addUserToDb(userData user) (bool, error, user) {
+	userData.Id = helper.GenerateUniqueId()
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(userData.Password), bcrypt.DefaultCost)
+	userData.hashedPassword = hashedPassword
 	if err != nil {
-		return false, err
+		return false, err, user{}
 	}
 	//if value == nil {
-	user.Img_url = fmt.Sprintf("https://%s%s/public/img/user/default.jpg", HOST, PORT)
+	userData.ImgUrl = "https://" + config.HOST + config.PORT + "/public/img/user_default.jpg"
 	//} else {
-	//	user.Img_url = "https://localhost:3300/public/img/user/" + strconv.Itoa(int(user.Id)) + ".jpg"
+	//	websocket.Img_url = "https://localhost:3300/public/img/user/" + strconv.Itoa(int(websocket.Id)) + ".jpg"
 	//}
 
-	db, err := sql.Open("sqlite3", "../data/data.sqlite")
+	tx, err := config.UseDBPool().DB.Begin()
 	if err != nil {
-		return false, err
+		log.Println(err)
+		return false, err, user{}
 	}
 
-	exists, err := checkIfUserExists(db, user.Username, user.Email)
+	defer func() {
+		if err := config.UseDBPool().RollbackOrCommit(tx, err == nil); err != nil {
+			log.Println("Error rolling back transaction:", err)
+		}
+	}()
+
+	exists, err := checkIfUserExists(tx, userData.Username, userData.Email)
 	if err != nil {
 		log.Print(err)
 	}
 	if exists {
-		return false, err
+		return false, err, user{}
 	}
 
-	db.Exec("INSERT INTO users (user_id, username, display_name, email, language, status, bio, custom_status, img_url, password) VALUES (?,?,?,?,'en',1,NULL, NULL,?, ?)", user.Id, user.Username, user.Display_name, user.Email, user.Img_url, user.hashedPassword)
-	return true, nil
+	_, err = tx.Exec("INSERT INTO users (user_id, username, display_name, email, language, status, appearance, img_url, password) VALUES (?,?,?,?,'en',null,1,?, ?)", userData.Id, userData.Username, userData.DisplayName, userData.Email, userData.ImgUrl, userData.hashedPassword)
+	if err != nil {
+		return false, err, user{}
+	}
+	return true, nil, user{Id: userData.Id, Username: userData.Username, DisplayName: userData.DisplayName}
 }
 
-func checkIfUserExists(db *sql.DB, username, email string) (bool, error) {
+func checkIfUserExists(tx *sql.Tx, username, email string) (bool, error) {
 	query := "SELECT COUNT(*) FROM users WHERE username = ? OR email = ?"
 
 	var count int
-	err := db.QueryRow(query, username, email).Scan(&count)
+	err := tx.QueryRow(query, username, email).Scan(&count)
 	if err != nil {
 		return false, err
 	}
@@ -207,32 +237,10 @@ func generateJWTToken(user user) (string, error) {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenString, err := token.SignedString(secretKey)
+	tokenString, err := token.SignedString(config.JwtKey)
 	if err != nil {
 		return "", err
 	}
 
 	return tokenString, nil
-}
-
-func signout(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     "token",
-		Value:    "",
-		Expires:  time.Unix(0, 0),
-		Path:     "/",
-		HttpOnly: true,
-	})
-
-	responseMessage := map[string]string{"message": "You've been signed out!"}
-
-	responseJSON, err := json.Marshal(responseMessage)
-	if err != nil {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(responseJSON)
 }

@@ -14,18 +14,18 @@ db.run(`
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         username TEXT NOT NULL,
-        display_name TEXT
+        display_name TEXT,
         password TEXT,
         email TEXT,
         language TEXT,
-        status INTEGER,
+		appearance INTEGER,
         bio TEXT,
-        custom_status TEXT,
+        status TEXT,
         last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
         joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         pronouns TEXT,
         img_url TEXT,
-        password TEXT
+		online BOOLEAN
     )
 `);
 
@@ -56,13 +56,24 @@ db.run(`
     CREATE TABLE IF NOT EXISTS messages (
         message_id INTEGER PRIMARY KEY,
         channel_id INTEGER,
-        user_id INTEGER,
+        user_id INTEGER UNIQUE,
         message_text TEXT NOT NULL,
         sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (channel_id) REFERENCES channels(channel_id),
         FOREIGN KEY (user_id) REFERENCES users(user_id)
     )
 `);
+
+db.run(`
+    CREATE TABLE IF NOT EXISTS invite_links
+    (
+        id          integer primary key,
+        invite_code text server_id INTEGER not null,
+        server_id   int,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (server_id) REFERENCES servers (server_id)
+    )
+`)
 
 db.close((err) => {
 	if (err) {

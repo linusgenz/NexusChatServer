@@ -4,6 +4,7 @@ import (
 	"github.com/gorilla/websocket"
 	"log"
 	"net/http"
+	"strconv"
 	"webserver/internal/helper"
 )
 
@@ -42,12 +43,12 @@ func HandleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 	socketId := helper.GenerateUniqueId()
 	log.Println("Client Connected")
 
-	err = ws.WriteJSON(webSocketResponse{Type: "connection-success", Data: map[string]interface{}{"socketId": socketId}})
+	err = ws.WriteJSON(webSocketResponse{Type: "connection-success", Data: map[string]interface{}{"socketId": strconv.FormatInt(socketId, 10)}})
 	if err != nil {
 		log.Println(err)
 		return
 	}
-	log.Println("before go")
+
 	go handleWebSocket(ws, socketId)
 }
 
@@ -74,7 +75,7 @@ func handleWebSocket(ws *websocket.Conn, socketId int64) {
 			ws.WriteJSON(webSocketResponse{Type: "joinedChannel"})
 
 		case "offer":
-			answer, err := processOffer(request, ws)
+			answer, err := processOffer(request)
 			if err != nil {
 				log.Fatalln(err)
 				return
@@ -94,8 +95,8 @@ func handleWebSocket(ws *websocket.Conn, socketId int64) {
 }
 
 func handleDisconnect(request webSocketRequest) {
-	socketId := int64(request.Data["socketId"].(float64))
-	channelId := int64(request.Data["channelId"].(float64))
+	channelId, _ := strconv.ParseInt(request.Data["channelId"].(string), 10, 64)
+	socketId, _ := strconv.ParseInt(request.Data["socketId"].(string), 10, 64)
 
 	channels[channelId].mu.Lock()
 	delete(channels[channelId].peers, socketId)

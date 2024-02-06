@@ -1,15 +1,20 @@
 package helper
 
 import (
-	"math/rand"
-	"time"
+	"github.com/google/uuid"
+	"hash/fnv"
 )
 
 // Internal function for unique ids
+
 func GenerateUniqueId() int64 {
-	currentTime := time.Now()
-	timestamp := currentTime.UnixMilli()
-	randomFactor := rand.Intn(100) + 1
-	uniqueID := timestamp * int64(randomFactor)
-	return uniqueID
+	uuid := uuid.New()
+	hashedValue := hashUUID(uuid)
+	return int64(hashedValue)
+}
+
+func hashUUID(u uuid.UUID) uint64 {
+	h := fnv.New64a()
+	h.Write(u[:])
+	return h.Sum64()
 }

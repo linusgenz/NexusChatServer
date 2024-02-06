@@ -4,7 +4,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
 	"log"
-	"net/http"
+	//"net/http"
 	"strconv"
 	"sync"
 	"webserver/internal/helper"
@@ -12,16 +12,19 @@ import (
 
 type VoiceChannel struct {
 	channelId int64
-	peers     map[int64]Peer
+	peers     map[int64]*Peer
 	mu        sync.Mutex
 }
 
 type Peer struct {
-	webSocket      *websocket.Conn
-	AudioTrack     *webrtc.TrackLocalStaticRTP
-	VideoTrack     *webrtc.TrackLocalStaticRTP
-	peerConnection *webrtc.PeerConnection
-	peerDetails    struct {
+	writeMessageToWebSocket func(peer *Peer, data webSocketResponse) error
+	connectionId            int64
+	ws                      *websocket.Conn
+	mu                      sync.Mutex
+	AudioTrack              *webrtc.TrackLocalStaticRTP
+	VideoTrack              *webrtc.TrackLocalStaticRTP
+	peerConnection          *webrtc.PeerConnection
+	peerDetails             struct {
 		name    string
 		isAdmin bool
 	}
@@ -29,15 +32,28 @@ type Peer struct {
 
 var channels = make(map[int64]*VoiceChannel)
 
+func writeMessageToWebSocket(peer *Peer, data webSocketResponse) error {
+	log.Print(&peer.mu)
+
+	peer.mu.Lock()
+	err := peer.ws.WriteJSON(data)
+	peer.mu.Unlock()
+	if err != nil {
+		log.Print("Error writing message to websocket:", err)
+		return err
+	}
+	return nil
+}
+
 func joinChannel(request webSocketRequest, ws *websocket.Conn) error {
-	channelId := int64(request.Data["channelId"].(float64))
-	socketId := int64(request.Data["socketId"].(float64))
+	channelId, _ := strconv.ParseInt(request.Data["channelId"].(string), 10, 64)
+	socketId, _ := strconv.ParseInt(request.Data["socketId"].(string), 10, 64)
 
 	channel, ok := channels[channelId]
 	if !ok {
 		channel = &VoiceChannel{
 			channelId: channelId,
-			peers:     make(map[int64]Peer),
+			peers:     make(map[int64]*Peer),
 		}
 
 	} else {
@@ -64,7 +80,6 @@ func joinChannel(request webSocketRequest, ws *websocket.Conn) error {
 	if err != nil {
 		return err
 	}
-	// bitrate etc maxIncomeBitrate: 3072000,
 
 	videoCodecs := webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000}
 	videoTrack, err := webrtc.NewTrackLocalStaticRTP(videoCodecs, strconv.Itoa(int(socketId))+"video-RTP", "video")
@@ -73,27 +88,20 @@ func joinChannel(request webSocketRequest, ws *websocket.Conn) error {
 	}
 
 	channel.mu.Lock()
-	channel.peers[socketId] = Peer{webSocket: ws, peerConnection: peerConnection, AudioTrack: audioTrack, VideoTrack: videoTrack}
-	channel.mu.Unlock()
+	channel.peers[socketId] = &Peer{writeMessageToWebSocket: writeMessageToWebSocket, ws: ws, peerConnection: peerConnection, connectionId: socketId, AudioTrack: audioTrack, VideoTrack: videoTrack}
 	channels[channelId] = channel
+	channel.mu.Unlock()
 
-	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		if track.Kind() == webrtc.RTPCodecTypeAudio {
-			log.Println("Received audio track:", track.ID())
-		} else if track.Kind() == webrtc.RTPCodecTypeVideo {
-			log.Println("Received video track:", track.ID())
-		}
+	peerConnection.OnTrack(handleOnTrack(channel.peers[socketId], channelId))
 
-		// Forward incoming tracks to other peers
-		handleOnTrack(channel.peers[socketId], channelId, track, receiver)
-	})
+	// rethink design pattern
 
 	go func() {
 		for {
 			select {
 			case iceCandidate := <-iceCandidateChan:
-				
-				channel.peers[socketId].webSocket.WriteJSON(webSocketResponse{Type: "ice-candidate", Data: map[string]interface{}{"candidate": iceCandidate}})
+
+				channel.peers[socketId].writeMessageToWebSocket(channel.peers[socketId], webSocketResponse{Type: "ice-candidate", Data: map[string]interface{}{"candidate": iceCandidate}})
 			}
 		}
 	}()
@@ -101,17 +109,18 @@ func joinChannel(request webSocketRequest, ws *websocket.Conn) error {
 	return nil
 }
 
-func processOffer(request webSocketRequest, ws *websocket.Conn) (webrtc.SessionDescription, error) {
-	channelId := int64(request.Data["channelId"].(float64))
-	socketId := int64(request.Data["socketId"].(float64))
+func processOffer(request webSocketRequest) (webrtc.SessionDescription, error) {
+	channelId, _ := strconv.ParseInt(request.Data["channelId"].(string), 10, 64)
+	socketId, _ := strconv.ParseInt(request.Data["socketId"].(string), 10, 64)
 	var offer webrtc.SessionDescription
 	offerSDP := request.Data["offer"].(map[string]interface{})
 	offer.SDP = offerSDP["sdp"].(string)
 	sdpTypeStr := offerSDP["type"].(string)
 	offerType, err := helper.MapStringToSDPType(sdpTypeStr)
 	offer.Type = offerType
+	peer := channels[channelId].peers[socketId]
 	if err != nil {
-		channels[channelId].peers[socketId].webSocket.WriteJSON(webSocketError{Status: http.StatusBadRequest, StatusText: "Invalid request, SDP type is invalid"})
+		//channels[channelId].peers[socketId].writeMessageToWebSocket(channels[channelId].peers[socketId], webSocketError{Status: http.StatusBadRequest, StatusText: "Invalid request, SDP type is invalid"})
 
 		return webrtc.SessionDescription{}, err
 	}
@@ -121,8 +130,8 @@ func processOffer(request webSocketRequest, ws *websocket.Conn) (webrtc.SessionD
 		return webrtc.SessionDescription{}, err
 	}
 
-	audioTrack := channels[channelId].peers[socketId].AudioTrack
-	videoTrack := channels[channelId].peers[socketId].VideoTrack
+	audioTrack := peer.AudioTrack
+	videoTrack := peer.VideoTrack
 
 	_, err = peerConnection.AddTrack(audioTrack)
 	if err != nil {
@@ -134,7 +143,11 @@ func processOffer(request webSocketRequest, ws *websocket.Conn) (webrtc.SessionD
 		return webrtc.SessionDescription{}, err
 	}
 
-	answer, err := peerConnection.CreateAnswer(nil)
+	answer, err := peerConnection.CreateAnswer(&webrtc.AnswerOptions{
+		OfferAnswerOptions: webrtc.OfferAnswerOptions{
+			VoiceActivityDetection: true,
+		},
+	})
 	if err != nil {
 		return webrtc.SessionDescription{}, err
 	}
@@ -147,8 +160,8 @@ func processOffer(request webSocketRequest, ws *websocket.Conn) (webrtc.SessionD
 }
 
 func handleICECandidate(request webSocketRequest, ws *websocket.Conn) error {
-	socketId := int64(request.Data["socketId"].(float64))
-	channelId := int64(request.Data["channelId"].(float64))
+	channelId, _ := strconv.ParseInt(request.Data["channelId"].(string), 10, 64)
+	socketId, _ := strconv.ParseInt(request.Data["socketId"].(string), 10, 64)
 	iceCandidateInit := request.Data["candidate"].(map[string]interface{})
 	candidate := iceCandidateInit["candidate"].(string)
 	sdpMid := iceCandidateInit["sdpMid"].(string)
@@ -171,30 +184,36 @@ func handleICECandidate(request webSocketRequest, ws *websocket.Conn) error {
 	return nil
 }
 
-func handleOnTrack(peer Peer, channelId int64, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-	go func() {
-		for {
-			rtpPacket, _, err := track.ReadRTP()
-			//log.Println("ATTRIBUTES:", attributes)
-			if err != nil {
-				log.Println("Error reading RTP packet:", err)
-				break
-			}
+func handleOnTrack(peer *Peer, channelId int64) func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+	return func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		if track.Kind() == webrtc.RTPCodecTypeAudio {
+			log.Println("Received audio track:", track.ID())
+		} else if track.Kind() == webrtc.RTPCodecTypeVideo {
+			log.Println("Received video track:", track.ID())
+		}
+		go func() {
+			for {
+				rtpPacket, _, err := track.ReadRTP()
+				if err != nil {
+					log.Println("Error reading RTP packet:", err)
+					break
+				}
 
-			// Forward the RTP packet to other peers in the same channel
-			for _, otherPeer := range channels[channelId].peers {
-				if otherPeer != peer {
-					if track.Kind() == webrtc.RTPCodecTypeAudio {
-						err = otherPeer.AudioTrack.WriteRTP(rtpPacket)
-					} else if track.Kind() == webrtc.RTPCodecTypeVideo {
-						err = otherPeer.VideoTrack.WriteRTP(rtpPacket) // ERR here when user in channel and other joins or e.g.
-					}
+				// Forward the RTP packet to other peers in the same channel
+				for _, otherPeer := range channels[channelId].peers {
+					if otherPeer.connectionId != peer.connectionId {
+						if track.Kind() == webrtc.RTPCodecTypeAudio {
+							err = otherPeer.AudioTrack.WriteRTP(rtpPacket)
+						} else if track.Kind() == webrtc.RTPCodecTypeVideo {
+							err = otherPeer.VideoTrack.WriteRTP(rtpPacket)
+						}
 
-					if err != nil {
-						log.Println("Error forwarding RTP packet:", err)
+						if err != nil {
+							log.Println("Error forwarding RTP packet:", err)
+						}
 					}
 				}
 			}
-		}
-	}()
+		}()
+	}
 }

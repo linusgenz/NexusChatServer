@@ -2,22 +2,35 @@ package main
 
 import (
 	"crypto/tls"
-	"log"
-	"net/http"
-	"os"
-	"webserver/internal/api"
-	"webserver/internal/webrtc"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
-	"github.com/joho/godotenv"
+	"log"
+	"net/http"
+	"webserver/internal/api"
+	"webserver/internal/config"
+	"webserver/internal/webrtc"
+	"webserver/internal/websocket"
 )
 
 func main() {
-	if err := godotenv.Load("../.env"); err != nil {
-		log.Fatal("Error loading .env file", err)
+	config.LoadConfig()
+	//croc.DeleteExpiredInviteLinks()
+
+	dbConfig := config.DatabaseConfig{
+		Driver:   "sqlite3",
+		Source:   "../data/data.sqlite",
+		MaxConns: 50,
 	}
 
-	PORT := os.Getenv("PORT")
+	pool, err := config.NewDatabasePool(dbConfig)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer pool.DB.Close()
+
+	config.InitDatabase(pool)
+
 	router := mux.NewRouter()
 
 	headersOk := handlers.AllowedHeaders([]string{"Content-Type", "Authorization"})
@@ -26,16 +39,24 @@ func main() {
 	handler := handlers.CORS(headersOk, originsOk, methodsOk)(router)
 
 	apiRouter := router.PathPrefix("/api").Subrouter()
-	apiRouter.HandleFunc("/list", api.List).Methods("GET")
-	apiRouter.HandleFunc("/{serverid}/channels", api.Channels).Methods("GET")
-	apiRouter.HandleFunc("/create", api.Create).Methods("POST")
+	createRouter := apiRouter.PathPrefix("/create").Subrouter()
+	createRouter.HandleFunc("/server", api.Create).Methods("POST")
+	createRouter.HandleFunc("/invitelink", api.CreateInviteLink).Methods("POST")
+	apiRouter.HandleFunc("/{userId}/server", api.UserServer).Methods("GET")
+	apiRouter.HandleFunc("/{serverId}/channels", api.Channels).Methods("GET")
+	apiRouter.HandleFunc("/{serverId}/members", api.ServerMembers).Methods("GET")
+	apiRouter.HandleFunc("/{userId}/joinServer/{inviteId}", api.JoinServer).Methods("GET")
 	apiRouter.HandleFunc("/auth/login", api.LoginHandler).Methods("POST")
 	apiRouter.HandleFunc("/auth/register", api.RegisterHandler).Methods("POST")
+
+	router.HandleFunc("/invite/{code}/{userId}", api.JoinServer).Methods("GET")
+
 	router.PathPrefix("/public/").Handler(http.StripPrefix("/public/", http.FileServer(http.Dir("../public"))))
 
-	log.Printf("Go server running at port %v \n", PORT)
 	router.Handle("/", handler)
-	router.HandleFunc("/wss", webrtc.HandleWebSocketConnections)
+
+	router.HandleFunc("/webrtc", webrtc.HandleWebSocketConnections)
+	router.HandleFunc("/wss", websocket.HandleWebSocketConnections)
 
 	tlsConfig := &tls.Config{
 		MinVersion:               tls.VersionTLS12,
@@ -45,10 +66,14 @@ func main() {
 	}
 
 	server := &http.Server{
-		Addr:      PORT,
+		Addr:      config.PORT,
 		Handler:   handler,
 		TLSConfig: tlsConfig,
 	}
 
-	server.ListenAndServeTLS("../ssl/cert.pem", "../ssl/key.pem")
+	log.Printf("Go server running at port %v \n", config.PORT)
+	err = server.ListenAndServeTLS("../ssl/cert.pem", "../ssl/key.pem")
+	if err != nil {
+		log.Fatal("Could not start https server", err)
+	}
 }
